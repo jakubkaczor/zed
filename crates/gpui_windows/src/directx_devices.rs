@@ -5,8 +5,8 @@ use windows::Win32::{
     Foundation::HMODULE,
     Graphics::{
         Direct3D::{
-            D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_10_1,
-            D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+            D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL,
+            D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
         },
         Direct3D11::{
             D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_DEBUG,
@@ -48,8 +48,13 @@ impl DirectXDevices {
         let debug_layer_available = check_debug_layer_available();
         let dxgi_factory =
             get_dxgi_factory(debug_layer_available).context("Creating DXGI factory")?;
-        let (adapter, device, device_context, feature_level) =
-            get_adapter(&dxgi_factory, debug_layer_available).context("Getting DXGI adapter")?;
+        let (adapter, device, device_context, feature_level) = if std::env::var_os("ZED_USE_WARP")
+            .is_some()
+        {
+            get_warp_device(&dxgi_factory, debug_layer_available).context("Getting WARP device")?
+        } else {
+            get_adapter(&dxgi_factory, debug_layer_available).context("Getting DXGI adapter")?
+        };
         match feature_level {
             D3D_FEATURE_LEVEL_11_1 => {
                 log::info!("Created device with Direct3D 11.1 feature level.")
@@ -70,6 +75,81 @@ impl DirectXDevices {
             device_context,
         })
     }
+}
+
+fn get_warp_device(
+    dxgi_factory: &IDXGIFactory6,
+    debug_layer_available: bool,
+) -> Result<(
+    IDXGIAdapter1,
+    ID3D11Device,
+    ID3D11DeviceContext,
+    D3D_FEATURE_LEVEL,
+)> {
+    log::info!("Using WARP software rasterizer");
+
+    let mut device: Option<ID3D11Device> = None;
+    let mut context: Option<ID3D11DeviceContext> = None;
+    let mut feature_level = D3D_FEATURE_LEVEL::default();
+
+    let device_flags = if debug_layer_available {
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_DEBUG
+    } else {
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT
+    };
+
+    unsafe {
+        D3D11CreateDevice(
+            None,
+            D3D_DRIVER_TYPE_WARP,
+            HMODULE::default(),
+            device_flags,
+            Some(&[
+                D3D_FEATURE_LEVEL_11_1,
+                D3D_FEATURE_LEVEL_11_0,
+                D3D_FEATURE_LEVEL_10_1,
+            ]),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            Some(&mut feature_level),
+            Some(&mut context),
+        )?;
+    }
+
+    let device = device.unwrap();
+    let context = context.unwrap();
+
+    // Retrieve the DXGI adapter corresponding to the WARP device.
+    let dxgi_device = device.cast::<windows::Win32::Graphics::Dxgi::IDXGIDevice>()?;
+    let adapter = unsafe { dxgi_device.GetAdapter()? };
+    let adapter = adapter.cast::<IDXGIAdapter1>()?;
+
+    if let Ok(desc) = unsafe { adapter.GetDesc1() } {
+        let gpu_name = String::from_utf16_lossy(&desc.Description)
+            .trim_matches(char::from(0))
+            .to_string();
+
+        log::info!("WARP adapter: {}", gpu_name);
+    }
+
+    let mut data = D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS::default();
+
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D11_FEATURE_D3D10_X_HARDWARE_OPTIONS,
+            &mut data as *mut _ as _,
+            std::mem::size_of::<D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS>() as u32,
+        )?;
+    }
+
+    if !data
+        .ComputeShaders_Plus_RawAndStructuredBuffers_Via_Shader_4_x
+        .as_bool()
+    {
+        anyhow::bail!("WARP does not support required StructuredBuffer feature");
+    }
+
+    Ok((adapter, device, context, feature_level))
 }
 
 #[inline]
