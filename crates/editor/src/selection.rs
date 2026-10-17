@@ -800,6 +800,24 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.select_syntax_node_sibling(true, window, cx);
+    }
+
+    pub fn select_prev_syntax_node(
+        &mut self,
+        _: &SelectPreviousSyntaxNode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_syntax_node_sibling(false, window, cx);
+    }
+
+    fn select_syntax_node_sibling(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let old_selections = self.selections.all_anchors(&self.display_snapshot(cx));
         if old_selections.is_empty() {
             return;
@@ -807,7 +825,6 @@ impl Editor {
 
         let buffer = self.buffer.read(cx).snapshot(cx);
         let mut selected_sibling = false;
-
         let new_selections = old_selections
             .iter()
             .map(|selection| {
@@ -816,7 +833,12 @@ impl Editor {
                 if let Some(results) = buffer.map_excerpt_ranges(
                     old_range,
                     |buf, _excerpt_range, input_buffer_range| {
-                        let Some(node) = buf.syntax_next_sibling(input_buffer_range) else {
+                        let node = if forward {
+                            buf.syntax_next_sibling(input_buffer_range)
+                        } else {
+                            buf.syntax_prev_sibling(input_buffer_range)
+                        };
+                        let Some(node) = node else {
                             return Vec::new();
                         };
                         vec![(
@@ -830,64 +852,6 @@ impl Editor {
                     selected_sibling = true;
                     let new_range =
                         buffer.anchor_after(new_range.start)..buffer.anchor_before(new_range.end);
-                    Selection {
-                        id: selection.id,
-                        start: new_range.start,
-                        end: new_range.end,
-                        goal: SelectionGoal::None,
-                        reversed: selection.reversed,
-                    }
-                } else {
-                    *selection
-                }
-            })
-            .collect::<Vec<_>>();
-
-        if selected_sibling {
-            self.change_selections(
-                SelectionEffects::scroll(Autoscroll::fit()),
-                window,
-                cx,
-                |s| {
-                    s.select(new_selections);
-                },
-            );
-        }
-    }
-
-    pub fn select_prev_syntax_node(
-        &mut self,
-        _: &SelectPreviousSyntaxNode,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let old_selections: Arc<[_]> = self.selections.all_anchors(&self.display_snapshot(cx));
-
-        let multibuffer_snapshot = self.buffer.read(cx).snapshot(cx);
-        let mut selected_sibling = false;
-
-        let new_selections = old_selections
-            .iter()
-            .map(|selection| {
-                let old_range = selection.start.to_offset(&multibuffer_snapshot)
-                    ..selection.end.to_offset(&multibuffer_snapshot);
-                if let Some(results) = multibuffer_snapshot.map_excerpt_ranges(
-                    old_range,
-                    |buf, _excerpt_range, input_buffer_range| {
-                        let Some(node) = buf.syntax_prev_sibling(input_buffer_range) else {
-                            return Vec::new();
-                        };
-                        vec![(
-                            BufferOffset(node.byte_range().start)
-                                ..BufferOffset(node.byte_range().end),
-                            (),
-                        )]
-                    },
-                ) && let [(new_range, _)] = results.as_slice()
-                {
-                    selected_sibling = true;
-                    let new_range = multibuffer_snapshot.anchor_after(new_range.start)
-                        ..multibuffer_snapshot.anchor_before(new_range.end);
                     Selection {
                         id: selection.id,
                         start: new_range.start,

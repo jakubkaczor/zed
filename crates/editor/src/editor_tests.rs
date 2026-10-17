@@ -43010,104 +43010,174 @@ async fn test_non_utf_8_opens(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_select_next_prev_syntax_node(cx: &mut TestAppContext) {
+async fn test_syntax_sibling_selection_wraps_at_group_boundaries(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
+    let text = "fn first() {}\nfn second() {}";
+    let first_range = 0.."fn first() {}".len();
+    let second_range = first_range.end + 1..text.len();
     let language = Arc::new(Language::new(
         LanguageConfig::default(),
         Some(tree_sitter_rust::LANGUAGE.into()),
     ));
-
-    // Test hierarchical sibling navigation
-    let text = r#"
-        fn outer() {
-            if condition {
-                let a = 1;
-            }
-            let b = 2;
-        }
-
-        fn another() {
-            let c = 3;
-        }
-    "#;
-
     let buffer = cx.new(|cx| Buffer::local(text, cx).with_language(language, cx));
     let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
     let (editor, cx) = cx.add_window_view(|window, cx| build_editor(buffer, window, cx));
 
-    // Wait for parsing to complete
     editor
         .condition::<crate::EditorEvent>(cx, |editor, cx| !editor.buffer.read(cx).is_parsing(cx))
         .await;
 
     editor.update_in(cx, |editor, window, cx| {
-        // Start by selecting "let a = 1;" inside the if block
-        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_display_ranges([
-                DisplayPoint::new(DisplayRow(3), 16)..DisplayPoint::new(DisplayRow(3), 26)
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.select_ranges([
+                MultiBufferOffset(first_range.start)..MultiBufferOffset(first_range.end)
             ]);
         });
-
-        let initial_selection = editor
-            .selections
-            .display_ranges(&editor.display_snapshot(cx));
-        assert_eq!(initial_selection.len(), 1, "Should have one selection");
-
-        // Test select next sibling - should move up levels to find the next sibling
-        // Since "let a = 1;" has no siblings in the if block, it should move up
-        // to find "let b = 2;" which is a sibling of the if block
-        editor.select_next_syntax_node(&SelectNextSyntaxNode, window, cx);
-        let next_selection = editor
-            .selections
-            .display_ranges(&editor.display_snapshot(cx));
-
-        // Should have a selection and it should be different from the initial
-        assert_eq!(
-            next_selection.len(),
-            1,
-            "Should have one selection after next"
-        );
-        assert_ne!(
-            next_selection[0], initial_selection[0],
-            "Next sibling selection should be different"
-        );
-
-        // Test hierarchical navigation by going to the end of the current function
-        // and trying to navigate to the next function
-        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_display_ranges([
-                DisplayPoint::new(DisplayRow(5), 12)..DisplayPoint::new(DisplayRow(5), 22)
-            ]);
-        });
-
-        editor.select_next_syntax_node(&SelectNextSyntaxNode, window, cx);
-        let function_next_selection = editor
-            .selections
-            .display_ranges(&editor.display_snapshot(cx));
-
-        // Should move to the next function
-        assert_eq!(
-            function_next_selection.len(),
-            1,
-            "Should have one selection after function next"
-        );
-
-        // Test select previous sibling navigation
         editor.select_prev_syntax_node(&SelectPreviousSyntaxNode, window, cx);
-        let prev_selection = editor
+        let selection = editor
             .selections
-            .display_ranges(&editor.display_snapshot(cx));
-
-        // Should have a selection and it should be different
+            .all::<MultiBufferOffset>(&editor.display_snapshot(cx));
+        assert_eq!(selection.len(), 1);
         assert_eq!(
-            prev_selection.len(),
-            1,
-            "Should have one selection after prev"
+            selection[0].start..selection[0].end,
+            MultiBufferOffset(second_range.start)..MultiBufferOffset(second_range.end)
         );
-        assert_ne!(
-            prev_selection[0], function_next_selection[0],
-            "Previous sibling selection should be different from next"
+
+        editor.select_next_syntax_node(&SelectNextSyntaxNode, window, cx);
+        let selection = editor
+            .selections
+            .all::<MultiBufferOffset>(&editor.display_snapshot(cx));
+        assert_eq!(selection.len(), 1);
+        assert_eq!(
+            selection[0].start..selection[0].end,
+            MultiBufferOffset(first_range.start)..MultiBufferOffset(first_range.end)
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_syntax_sibling_selection_next_and_previous_are_inverses(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let text = "fn first() {}\nfn second() {}\nfn third() {}";
+    let first_length = "fn first() {}".len();
+    let second_length = "fn second() {}".len();
+    let first_range = 0..first_length;
+    let second_start = first_length + 1;
+    let second_range = second_start..second_start + second_length;
+    let third_start = second_range.end + 1;
+    let third_range = third_start..text.len();
+    let language = Arc::new(Language::new(
+        LanguageConfig::default(),
+        Some(tree_sitter_rust::LANGUAGE.into()),
+    ));
+    let buffer = cx.new(|cx| Buffer::local(text, cx).with_language(language, cx));
+    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    let (editor, cx) = cx.add_window_view(|window, cx| build_editor(buffer, window, cx));
+
+    editor
+        .condition::<crate::EditorEvent>(cx, |editor, cx| !editor.buffer.read(cx).is_parsing(cx))
+        .await;
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.select_ranges([
+                MultiBufferOffset(second_range.start)..MultiBufferOffset(second_range.end)
+            ]);
+        });
+        editor.select_next_syntax_node(&SelectNextSyntaxNode, window, cx);
+        let selection = editor
+            .selections
+            .all::<MultiBufferOffset>(&editor.display_snapshot(cx));
+        assert_eq!(selection.len(), 1);
+        assert_eq!(
+            selection[0].start..selection[0].end,
+            MultiBufferOffset(third_range.start)..MultiBufferOffset(third_range.end)
+        );
+
+        editor.select_prev_syntax_node(&SelectPreviousSyntaxNode, window, cx);
+        let selection = editor
+            .selections
+            .all::<MultiBufferOffset>(&editor.display_snapshot(cx));
+        assert_eq!(selection.len(), 1);
+        assert_eq!(
+            selection[0].start..selection[0].end,
+            MultiBufferOffset(second_range.start)..MultiBufferOffset(second_range.end)
+        );
+
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.select_ranges([
+                MultiBufferOffset(second_range.start)..MultiBufferOffset(second_range.end)
+            ]);
+        });
+        editor.select_prev_syntax_node(&SelectPreviousSyntaxNode, window, cx);
+        let selection = editor
+            .selections
+            .all::<MultiBufferOffset>(&editor.display_snapshot(cx));
+        assert_eq!(selection.len(), 1);
+        assert_eq!(
+            selection[0].start..selection[0].end,
+            MultiBufferOffset(first_range.start)..MultiBufferOffset(first_range.end)
+        );
+
+        editor.select_next_syntax_node(&SelectNextSyntaxNode, window, cx);
+        let selection = editor
+            .selections
+            .all::<MultiBufferOffset>(&editor.display_snapshot(cx));
+        assert_eq!(selection.len(), 1);
+        assert_eq!(
+            selection[0].start..selection[0].end,
+            MultiBufferOffset(second_range.start)..MultiBufferOffset(second_range.end)
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_syntax_sibling_selection_climbs_single_child_wrappers(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let text = "fn f() { while condition {} let node = value; }";
+    let while_start = "fn f() { ".len();
+    let while_range = while_start..while_start + "while condition {}".len();
+    let let_start = text.len() - "let node = value; }".len();
+    let let_range = let_start..let_start + "let node = value;".len();
+    let language = Arc::new(Language::new(
+        LanguageConfig::default(),
+        Some(tree_sitter_rust::LANGUAGE.into()),
+    ));
+    let buffer = cx.new(|cx| Buffer::local(text, cx).with_language(language, cx));
+    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    let (editor, cx) = cx.add_window_view(|window, cx| build_editor(buffer, window, cx));
+
+    editor
+        .condition::<crate::EditorEvent>(cx, |editor, cx| !editor.buffer.read(cx).is_parsing(cx))
+        .await;
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.select_ranges([
+                MultiBufferOffset(while_range.start)..MultiBufferOffset(while_range.end)
+            ]);
+        });
+        editor.select_next_syntax_node(&SelectNextSyntaxNode, window, cx);
+        let selection = editor
+            .selections
+            .all::<MultiBufferOffset>(&editor.display_snapshot(cx));
+        assert_eq!(selection.len(), 1);
+        assert_eq!(
+            selection[0].start..selection[0].end,
+            MultiBufferOffset(let_range.start)..MultiBufferOffset(let_range.end)
+        );
+
+        editor.select_prev_syntax_node(&SelectPreviousSyntaxNode, window, cx);
+        let selection = editor
+            .selections
+            .all::<MultiBufferOffset>(&editor.display_snapshot(cx));
+        assert_eq!(selection.len(), 1);
+        assert_eq!(
+            selection[0].start..selection[0].end,
+            MultiBufferOffset(while_range.start)..MultiBufferOffset(while_range.end)
         );
     });
 }
