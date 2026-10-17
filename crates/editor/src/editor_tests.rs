@@ -15629,6 +15629,252 @@ async fn test_select_previous_with_single_selection(cx: &mut TestAppContext) {
     cx.assert_editor_state("«ˇfoo»\n«ˇFOO»\n«ˇFoo»");
 }
 
+async fn build_editor_for_select_smaller_syntax_node_test<'a>(
+    cx: &'a mut TestAppContext,
+    marked_text: &str,
+) -> (Entity<Editor>, &'a mut VisualTestContext) {
+    init_test(cx, |_| {});
+
+    let (text, _) = marked_text_ranges(marked_text, true);
+    let language = Arc::new(Language::new(
+        LanguageConfig::default(),
+        Some(tree_sitter_rust::LANGUAGE.into()),
+    ));
+    let buffer = cx.new(|cx| Buffer::local(text, cx).with_language(language, cx));
+    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    let (editor, cx) = cx.add_window_view(|window, cx| build_editor(buffer, window, cx));
+
+    editor
+        .condition::<crate::EditorEvent>(cx, |editor, cx| !editor.buffer.read(cx).is_parsing(cx))
+        .await;
+    editor.update_in(cx, |editor, window, cx| {
+        select_ranges(editor, marked_text, window, cx);
+    });
+
+    (editor, cx)
+}
+
+#[gpui::test]
+async fn test_select_smaller_syntax_node_without_history_shrinks_forward_selection_to_last_named_child(
+    cx: &mut TestAppContext,
+) {
+    let (editor, cx) = build_editor_for_select_smaller_syntax_node_test(
+        cx,
+        indoc! {r#"
+            fn f() {
+                «let a = false;ˇ»
+            }
+        "#},
+    )
+    .await;
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.select_smaller_syntax_node(&SelectSmallerSyntaxNode, window, cx);
+    });
+
+    editor.update(cx, |editor, cx| {
+        assert_text_with_selections(
+            editor,
+            indoc! {r#"
+                fn f() {
+                    let a = «falseˇ»;
+                }
+            "#},
+            cx,
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_select_smaller_syntax_node_without_history_shrinks_reversed_selection_to_first_named_child(
+    cx: &mut TestAppContext,
+) {
+    let (editor, cx) = build_editor_for_select_smaller_syntax_node_test(
+        cx,
+        indoc! {r#"
+            fn f() {
+                «ˇlet a = false;»
+            }
+        "#},
+    )
+    .await;
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.select_smaller_syntax_node(&SelectSmallerSyntaxNode, window, cx);
+    });
+
+    editor.update(cx, |editor, cx| {
+        assert_text_with_selections(
+            editor,
+            indoc! {r#"
+                fn f() {
+                    let «ˇa» = false;
+                }
+            "#},
+            cx,
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_select_smaller_syntax_node_without_history_shrinks_each_selection_independently(
+    cx: &mut TestAppContext,
+) {
+    let (editor, cx) = build_editor_for_select_smaller_syntax_node_test(
+        cx,
+        indoc! {r#"
+            fn f() {
+                «let a = false;ˇ»
+                «let b = true;ˇ»
+            }
+        "#},
+    )
+    .await;
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.select_smaller_syntax_node(&SelectSmallerSyntaxNode, window, cx);
+    });
+
+    editor.update(cx, |editor, cx| {
+        assert_text_with_selections(
+            editor,
+            indoc! {r#"
+                fn f() {
+                    let a = «falseˇ»;
+                    let b = «trueˇ»;
+                }
+            "#},
+            cx,
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_select_smaller_syntax_node_without_history_leaves_partial_node_selection_unchanged(
+    cx: &mut TestAppContext,
+) {
+    let (editor, cx) = build_editor_for_select_smaller_syntax_node_test(
+        cx,
+        indoc! {r#"
+            fn f() {
+                let «a =ˇ» false;
+            }
+        "#},
+    )
+    .await;
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.select_smaller_syntax_node(&SelectSmallerSyntaxNode, window, cx);
+    });
+
+    editor.update(cx, |editor, cx| {
+        assert_text_with_selections(
+            editor,
+            indoc! {r#"
+                fn f() {
+                    let «a =ˇ» false;
+                }
+            "#},
+            cx,
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_select_smaller_syntax_node_without_history_leaves_node_without_smaller_child_unchanged(
+    cx: &mut TestAppContext,
+) {
+    let (editor, cx) = build_editor_for_select_smaller_syntax_node_test(
+        cx,
+        indoc! {r#"
+            fn f() {
+                let a = «falseˇ»;
+            }
+        "#},
+    )
+    .await;
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.select_smaller_syntax_node(&SelectSmallerSyntaxNode, window, cx);
+    });
+
+    editor.update(cx, |editor, cx| {
+        assert_text_with_selections(
+            editor,
+            indoc! {r#"
+                fn f() {
+                    let a = «falseˇ»;
+                }
+            "#},
+            cx,
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_select_smaller_syntax_node_without_history_leaves_caret_unchanged(
+    cx: &mut TestAppContext,
+) {
+    let (editor, cx) = build_editor_for_select_smaller_syntax_node_test(
+        cx,
+        indoc! {r#"
+            fn f() {
+                let a = faˇlse;
+            }
+        "#},
+    )
+    .await;
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.select_smaller_syntax_node(&SelectSmallerSyntaxNode, window, cx);
+    });
+
+    editor.update(cx, |editor, cx| {
+        assert_text_with_selections(
+            editor,
+            indoc! {r#"
+                fn f() {
+                    let a = faˇlse;
+                }
+            "#},
+            cx,
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_select_smaller_syntax_node_without_history_preserves_caret_while_shrinking_range(
+    cx: &mut TestAppContext,
+) {
+    let (editor, cx) = build_editor_for_select_smaller_syntax_node_test(
+        cx,
+        indoc! {r#"
+            fn f() {
+                let a = faˇlse;
+                «let b = true;ˇ»
+            }
+        "#},
+    )
+    .await;
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.select_smaller_syntax_node(&SelectSmallerSyntaxNode, window, cx);
+    });
+
+    editor.update(cx, |editor, cx| {
+        assert_text_with_selections(
+            editor,
+            indoc! {r#"
+                fn f() {
+                    let a = faˇlse;
+                    let b = «trueˇ»;
+                }
+            "#},
+            cx,
+        );
+    });
+}
+
 #[gpui::test]
 async fn test_select_larger_smaller_syntax_node(cx: &mut TestAppContext) {
     init_test(cx, |_| {});

@@ -12,6 +12,49 @@ enum SelectNextOrigin {
     Selection,
 }
 
+/// Finds the next smaller syntax range for one buffer-local selection.
+///
+/// The range must exactly match a named syntax node. Returns the range for its
+/// direct named child nearest the active selection end—the first child when
+/// reversed, or the last otherwise—or `None` if no eligible child exists.
+fn direct_smaller_syntax_node_range(
+    buffer: &language::BufferSnapshot,
+    selected_range: Range<BufferOffset>,
+    is_reversed: bool,
+) -> Option<Range<BufferOffset>> {
+    // Find the selected node, otherwise return None.
+    let ancestor_node = buffer.syntax_ancestor(selected_range.clone())?;
+    let selected_byte_range = selected_range.start.0..selected_range.end.0;
+    let mut ancestor_cursor = ancestor_node.walk();
+    let selected_node = ancestor_node
+        .named_children(&mut ancestor_cursor)
+        .find(|child| child.byte_range() == selected_byte_range)?;
+
+    // Select candidates nodes: named and having non-empty ranges smaller than
+    // the selected. This excludes cases such as wrapper nodes having only
+    // childs.
+    let mut selected_node_cursor = selected_node.walk();
+    let mut shrink_candidates = selected_node
+        .named_children(&mut selected_node_cursor)
+        .filter(|child| {
+            let child_range = child.byte_range();
+            // Meaningfully shrinkable.
+            child_range.start < child_range.end  // Non-empty
+                // Within selected, but different
+                && selected_range.start.0 <= child_range.start
+                && child_range.end <= selected_range.end.0
+                && child_range != selected_byte_range
+        });
+
+    let next_smaller_node = if is_reversed {
+        shrink_candidates.next()
+    } else {
+        shrink_candidates.last()
+    }?;
+
+    Some(BufferOffset(next_smaller_node.start_byte())..BufferOffset(next_smaller_node.end_byte()))
+}
+
 impl Editor {
     pub fn sync_selections(
         &mut self,
@@ -755,29 +798,45 @@ impl Editor {
         ));
     }
 
+    /// Shrinks the current selections.
+    ///
+    /// If history from `SelectLargerSyntaxNode` is available, restores the
+    /// previous selections. Otherwise, each non-empty selection that exactly
+    /// matches a named syntax node is shrunk to its nearest direct named child:
+    /// the last child for a forward selection, or the first for a reversed
+    /// selection. Carets, selections that do not exactly match a syntax node,
+    /// and nodes without an eligible child are left unchanged.
     pub fn select_smaller_syntax_node(
         &mut self,
         _: &SelectSmallerSyntaxNode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some((mut selections, scroll_behavior, is_selection_reversed)) =
+        // The "inverse" of this function, `select_larger_syntax_node`, records
+        // the history of increasingly expanding selections. If that history is
+        // non-empty, the last selection in that history is restored.
+        if let Some((mut previous_selections, scroll_behavior, is_selection_reversed)) =
             self.select_syntax_node_history.pop()
         {
-            if let Some(selection) = selections.last_mut() {
+            if let Some(selection) = previous_selections.last_mut() {
                 selection.reversed = is_selection_reversed;
             }
 
             let snapshot = self.buffer.read(cx).snapshot(cx);
-            let selections: Vec<Selection<MultiBufferOffset>> = selections
+            let restored_selections: Vec<Selection<MultiBufferOffset>> = previous_selections
                 .iter()
-                .map(|s| s.map(|anchor| anchor.to_offset(&snapshot)))
+                .map(|selection| selection.map(|anchor| anchor.to_offset(&snapshot)))
                 .collect();
 
             self.select_syntax_node_history.disable_clearing = true;
-            self.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                s.select(selections);
-            });
+            self.change_selections(
+                SelectionEffects::no_scroll(),
+                window,
+                cx,
+                |selection_collection| {
+                    selection_collection.select(restored_selections);
+                },
+            );
             self.select_syntax_node_history.disable_clearing = false;
 
             match scroll_behavior {
@@ -791,6 +850,84 @@ impl Editor {
                     self.scroll_cursor_bottom(&ScrollCursorBottom, window, cx);
                 }
             }
+            return;
+        }
+
+        // Given no selection history, new, smaller selections are
+        // computed.
+
+        let display_snapshot = self.display_snapshot(cx);
+        let current_selections = self.selections.all::<MultiBufferOffset>(&display_snapshot);
+        // Optimization: if each selection is just a cursor, there is no smaller
+        // selections, so the function can return immediately without
+        // snapshotting the buffer.
+        if current_selections
+            .iter()
+            .all(|selection| selection.start == selection.end)
+        {
+            return;
+        }
+
+        let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
+        // Optimization: decides whether a selection update should be emitted after computing updated selections below.
+        let mut found_smaller_node = false;
+        let updated_selections = current_selections
+            .into_iter()
+            .map(|selection| {
+                // Previously it was checked that there are non-empty ranges,
+                // but some empty ranges still may exist. They are left
+                // unchanged—mapped to themselves.
+                let current_range = selection.start..selection.end;
+                if current_range.is_empty() {
+                    return selection;
+                }
+
+                // One selection can span over multiple excerpts in
+                // the multi-buffer (None case). In that case, it is left
+                // unchanged, i.e. mapped to itself. Otherwise, the selection
+                // shrink is attempted. Success results in a singleton
+                // `mapped_range`. Empty when smaller range couldn't be found.
+                let Some(mapped_ranges) = buffer_snapshot.map_excerpt_ranges(
+                    current_range,
+                    |buffer, _, input_buffer_range| {
+                        direct_smaller_syntax_node_range(
+                            buffer,
+                            input_buffer_range,
+                            selection.reversed,
+                        )
+                        .into_iter()
+                        // `map_excerpt_ranges` carries metadata with each
+                        // range, but here it is not needed.
+                        .map(|smaller_range| (smaller_range, ()))
+                        .collect()
+                    },
+                ) else {
+                    // Selection spanned multiple excerpts.
+                    return selection;
+                };
+
+                let [(smaller_range, _)] = mapped_ranges.as_slice() else {
+                    // No unique smaller node was found, preserve this
+                    // selection unchanged.
+                    return selection;
+                };
+
+                found_smaller_node = true;
+                Selection {
+                    id: selection.id,
+                    start: smaller_range.start,
+                    end: smaller_range.end,
+                    goal: SelectionGoal::None,
+                    reversed: selection.reversed,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        // Optimization: avoid a selection-change event if none of the selections could be shrunk.
+        if found_smaller_node {
+            self.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select(updated_selections);
+            });
         }
     }
 
