@@ -15750,7 +15750,7 @@ async fn test_select_smaller_syntax_node_without_history_shrinks_each_selection_
 }
 
 #[gpui::test]
-async fn test_select_smaller_syntax_node_without_history_leaves_partial_node_selection_unchanged(
+async fn test_select_smaller_syntax_node_without_history_shrinks_to_node_contained_in_partial_selection(
     cx: &mut TestAppContext,
 ) {
     let (editor, cx) = build_editor_for_select_smaller_syntax_node_test(
@@ -15772,7 +15772,69 @@ async fn test_select_smaller_syntax_node_without_history_leaves_partial_node_sel
             editor,
             indoc! {r#"
                 fn f() {
-                    let «a =ˇ» false;
+                    let «aˇ» = false;
+                }
+            "#},
+            cx,
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_select_smaller_syntax_node_without_history_prefers_largest_node_at_active_edge(
+    cx: &mut TestAppContext,
+) {
+    let (editor, cx) = build_editor_for_select_smaller_syntax_node_test(
+        cx,
+        indoc! {r#"
+            fn f() {
+                let «x = a + bˇ»;
+            }
+        "#},
+    )
+    .await;
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.select_smaller_syntax_node(&SelectSmallerSyntaxNode, window, cx);
+    });
+
+    editor.update(cx, |editor, cx| {
+        assert_text_with_selections(
+            editor,
+            indoc! {r#"
+                fn f() {
+                    let x = «a + bˇ»;
+                }
+            "#},
+            cx,
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_select_smaller_syntax_node_without_history_leaves_partial_selection_without_named_node_unchanged(
+    cx: &mut TestAppContext,
+) {
+    let (editor, cx) = build_editor_for_select_smaller_syntax_node_test(
+        cx,
+        indoc! {r#"
+            fn f() {
+                let a «=ˇ» false;
+            }
+        "#},
+    )
+    .await;
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.select_smaller_syntax_node(&SelectSmallerSyntaxNode, window, cx);
+    });
+
+    editor.update(cx, |editor, cx| {
+        assert_text_with_selections(
+            editor,
+            indoc! {r#"
+                fn f() {
+                    let a «=ˇ» false;
                 }
             "#},
             cx,

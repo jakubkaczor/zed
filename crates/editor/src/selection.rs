@@ -12,47 +12,58 @@ enum SelectNextOrigin {
     Selection,
 }
 
-/// Finds the next smaller syntax range for one buffer-local selection.
+/// Finds the named syntax range inside a buffer-local selection that is nearest to its active end.
 ///
-/// The range must exactly match a named syntax node. Returns the range for its
-/// direct named child nearest the active selection end—the first child when
-/// reversed, or the last otherwise—or `None` if no eligible child exists.
-fn direct_smaller_syntax_node_range(
+/// The returned range is a non-empty, strict subrange of the selection. If candidates reach the
+/// same active edge, the largest range is returned. Returns `None` if no named node qualifies.
+fn smaller_syntax_node_range(
     buffer: &language::BufferSnapshot,
     selected_range: Range<BufferOffset>,
     is_reversed: bool,
 ) -> Option<Range<BufferOffset>> {
-    // Find the selected node, otherwise return None.
     let ancestor_node = buffer.syntax_ancestor(selected_range.clone())?;
     let selected_byte_range = selected_range.start.0..selected_range.end.0;
-    let mut ancestor_cursor = ancestor_node.walk();
-    let selected_node = ancestor_node
-        .named_children(&mut ancestor_cursor)
-        .find(|child| child.byte_range() == selected_byte_range)?;
+    let mut nodes = vec![ancestor_node];
+    let mut closest_range: Option<Range<usize>> = None;
 
-    // Select candidates nodes: named and having non-empty ranges smaller than
-    // the selected. This excludes cases such as wrapper nodes having only
-    // childs.
-    let mut selected_node_cursor = selected_node.walk();
-    let mut shrink_candidates = selected_node
-        .named_children(&mut selected_node_cursor)
-        .filter(|child| {
+    while let Some(node) = nodes.pop() {
+        let node_range = node.byte_range();
+        if node.is_named()
+            && node_range.start < node_range.end
+            && node_range.start >= selected_byte_range.start
+            && node_range.end <= selected_byte_range.end
+            && node_range != selected_byte_range
+        {
+            let should_replace_closest_range = match closest_range.as_ref() {
+                None => true,
+                Some(closest_range) if is_reversed => {
+                    node_range.start < closest_range.start
+                        || (node_range.start == closest_range.start
+                            && node_range.end > closest_range.end)
+                }
+                Some(closest_range) => {
+                    node_range.end > closest_range.end
+                        || (node_range.end == closest_range.end
+                            && node_range.start < closest_range.start)
+                }
+            };
+            if should_replace_closest_range {
+                closest_range = Some(node_range);
+            }
+        }
+
+        // A node may extend beyond the selection while one of its descendants is fully inside it.
+        // Only prune subtrees that cannot overlap the selection at all.
+        let mut cursor = node.walk();
+        nodes.extend(node.children(&mut cursor).filter(|child| {
             let child_range = child.byte_range();
-            // Meaningfully shrinkable.
-            child_range.start < child_range.end  // Non-empty
-                // Within selected, but different
-                && selected_range.start.0 <= child_range.start
-                && child_range.end <= selected_range.end.0
-                && child_range != selected_byte_range
-        });
+            child_range.start < selected_byte_range.end
+                && child_range.end > selected_byte_range.start
+        }));
+    }
 
-    let next_smaller_node = if is_reversed {
-        shrink_candidates.next()
-    } else {
-        shrink_candidates.last()
-    }?;
-
-    Some(BufferOffset(next_smaller_node.start_byte())..BufferOffset(next_smaller_node.end_byte()))
+    let smaller_range = closest_range?;
+    Some(BufferOffset(smaller_range.start)..BufferOffset(smaller_range.end))
 }
 
 impl Editor {
@@ -801,11 +812,10 @@ impl Editor {
     /// Shrinks the current selections.
     ///
     /// If history from `SelectLargerSyntaxNode` is available, restores the
-    /// previous selections. Otherwise, each non-empty selection that exactly
-    /// matches a named syntax node is shrunk to its nearest direct named child:
-    /// the last child for a forward selection, or the first for a reversed
-    /// selection. Carets, selections that do not exactly match a syntax node,
-    /// and nodes without an eligible child are left unchanged.
+    /// previous selections. Otherwise, each non-empty selection shrinks to a
+    /// non-empty named syntax range strictly inside it and nearest to its active
+    /// end. If candidates reach the same active edge, the largest range is chosen.
+    /// Carets and selections with no eligible named node are left unchanged.
     pub fn select_smaller_syntax_node(
         &mut self,
         _: &SelectSmallerSyntaxNode,
@@ -890,16 +900,12 @@ impl Editor {
                 let Some(mapped_ranges) = buffer_snapshot.map_excerpt_ranges(
                     current_range,
                     |buffer, _, input_buffer_range| {
-                        direct_smaller_syntax_node_range(
-                            buffer,
-                            input_buffer_range,
-                            selection.reversed,
-                        )
-                        .into_iter()
-                        // `map_excerpt_ranges` carries metadata with each
-                        // range, but here it is not needed.
-                        .map(|smaller_range| (smaller_range, ()))
-                        .collect()
+                        smaller_syntax_node_range(buffer, input_buffer_range, selection.reversed)
+                            .into_iter()
+                            // `map_excerpt_ranges` carries metadata with each
+                            // range, but here it is not needed.
+                            .map(|smaller_range| (smaller_range, ()))
+                            .collect()
                     },
                 ) else {
                     // Selection spanned multiple excerpts.
